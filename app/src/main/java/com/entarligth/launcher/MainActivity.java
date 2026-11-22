@@ -6,6 +6,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -27,6 +28,7 @@ public class MainActivity extends Activity {
 
     private TextView status, out;
     private LinearLayout buttons;
+    private PS5Controller controller;
     private File jre, game;
     private volatile boolean started;
 
@@ -68,7 +70,12 @@ public class MainActivity extends Activity {
         root.addView(status);
         root.addView(buttons);
         root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
-        setContentView(root);
+        FrameLayout frame = new FrameLayout(this);
+        frame.addView(root);
+        controller = new PS5Controller(this);
+        controller.setVisibility(View.GONE);
+        frame.addView(controller, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(frame);
 
         new Thread(this::prepare, "lumina-prepare").start(); // langsung loading saat dibuka
     }
@@ -187,6 +194,7 @@ public class MainActivity extends Activity {
         started = true;
         try {
             setStatus("Memuat Java...");
+            runOnUiThread(() -> controller.setVisibility(View.VISIBLE));
             String version = asset("game/version.id").trim();
             String assetId = asset("game/assetindex.id").trim();
 

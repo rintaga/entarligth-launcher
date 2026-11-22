@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <deque>
+#include <mutex>
 
 #define TAG  "LuminaCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -79,4 +81,64 @@ Java_com_entarligth_launcher_NativeBridge_launch(JNIEnv *env, jclass,
                         "", "", argv[0], argv[0], JNI_FALSE, JNI_TRUE, JNI_FALSE, 0);
     LOGI("JLI_Launch selesai rc=%d", rc);
     return rc;
+}
+
+
+// ---------------- Input controller virtual ----------------
+// Antrean event untuk GLFW shim (dibaca lewat lumina_poll_event / lumina_get_gamepad).
+struct LuminaInputEvent { int type; int a; int b; float x; float y; };
+enum { LEV_KEY = 1, LEV_MOUSE_BTN = 2, LEV_MOUSE_MOVE = 3, LEV_SCROLL = 4 };
+
+static std::mutex g_inMu;
+static std::deque<LuminaInputEvent> g_inQ;
+static float g_padAxes[6] = {0, 0, 0, 0, -1, -1};
+static int g_padButtons = 0;
+
+static void pushEv(const LuminaInputEvent &e) {
+    std::lock_guard<std::mutex> l(g_inMu);
+    if (g_inQ.size() >= 4096) g_inQ.pop_front();
+    g_inQ.push_back(e);
+}
+
+extern "C" bool lumina_poll_event(LuminaInputEvent *out) {
+    std::lock_guard<std::mutex> l(g_inMu);
+    if (g_inQ.empty()) return false;
+    *out = g_inQ.front();
+    g_inQ.pop_front();
+    return true;
+}
+
+extern "C" void lumina_get_gamepad(float *axes6, int *buttons) {
+    std::lock_guard<std::mutex> l(g_inMu);
+    for (int i = 0; i < 6; i++) axes6[i] = g_padAxes[i];
+    *buttons = g_padButtons;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_entarligth_launcher_NativeBridge_sendKey(JNIEnv *, jclass, jint key, jboolean down) {
+    pushEv({LEV_KEY, key, down ? 1 : 0, 0.f, 0.f});
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_entarligth_launcher_NativeBridge_sendMouseButton(JNIEnv *, jclass, jint btn, jboolean down) {
+    pushEv({LEV_MOUSE_BTN, btn, down ? 1 : 0, 0.f, 0.f});
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_entarligth_launcher_NativeBridge_sendMouseMove(JNIEnv *, jclass, jfloat dx, jfloat dy) {
+    pushEv({LEV_MOUSE_MOVE, 0, 0, dx, dy});
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_entarligth_launcher_NativeBridge_sendScroll(JNIEnv *, jclass, jfloat dy) {
+    pushEv({LEV_SCROLL, 0, 0, 0.f, dy});
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_entarligth_launcher_NativeBridge_sendGamepad(JNIEnv *env, jclass, jfloatArray axes, jint buttons) {
+    float tmp[6];
+    env->GetFloatArrayRegion(axes, 0, 6, tmp);
+    std::lock_guard<std::mutex> l(g_inMu);
+    for (int i = 0; i < 6; i++) g_padAxes[i] = tmp[i];
+    g_padButtons = buttons;
 }
