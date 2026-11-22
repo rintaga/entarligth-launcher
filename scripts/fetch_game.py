@@ -30,6 +30,10 @@ ai = vj["assetIndex"]
 open(f"{OUT}/assetindex.json", "wb").write(get(ai["url"]))
 open(f"{OUT}/assetindex.id", "w").write(ai["id"])
 open(f"{OUT}/version.id", "w").write(version)
+lw = next((l["name"].split(":")[-1] for l in vj["libraries"]
+           if l["name"].startswith("org.lwjgl:lwjgl:")), "")
+open(f"{OUT}/lwjgl.version", "w").write(lw)
+print("LWJGL versi Minecraft:", lw)
 
 def allowed(lib):
     rules = lib.get("rules")
@@ -57,8 +61,10 @@ with zipfile.ZipFile(f"{OUT}/libraries.zip", "w", zipfile.ZIP_DEFLATED) as z:
         if not art:
             continue
         path = art["path"]
-        if "lwjgl" in path or "natives" in path:
-            continue  # LWJGL (fork Android) dan natives Linux disediakan terpisah
+        if "natives" in path:
+            continue  # native Linux tidak dipakai di Android
+        if "lwjgl" in path and "lwjgl-glfw" not in path:
+            continue  # LWJGL Android dari assets/lwjgl; hanya GLFW resmi yang diambil
         data = get(art["url"])
         if hashlib.sha1(data).hexdigest() != art["sha1"]:
             sys.exit(f"::error::sha1 tidak cocok: {path}")

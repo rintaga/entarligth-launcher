@@ -5,3 +5,5 @@ app/src/main/assets/jre-*.zip
 app/src/main/assets/game/libraries.zip
 app/src/main/assets/game/version.json
 app/src/main/assets/game/assetindex.*
+app/src/main/assets/game/lwjgl.version
+app/src/main/assets/game/version.id

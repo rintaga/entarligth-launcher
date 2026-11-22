@@ -1,15 +1,17 @@
 // libluminacore.so - JNI loader untuk Entarligth Launcher
-// Memuat runtime OpenJDK (libjli.so) dari files/.plugin/jre lalu memanggil JLI_Launch.
+// 1) Memuat runtime OpenJDK (libjli.so) dari files/.plugin/jre lalu memanggil JLI_Launch.
+// 2) Meneruskan input controller virtual dan Surface ke libglfw.so.
 #include <jni.h>
+#include <android/native_window_jni.h>
+#include <android/log.h>
+#include <EGL/egl.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <android/log.h>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <deque>
-#include <mutex>
 
 #define TAG  "LuminaCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -22,6 +24,17 @@ typedef int (*JLI_Launch_t)(int argc, char **argv,
                             const char *pname, const char *lname,
                             jboolean javaargs, jboolean cpwildcard,
                             jboolean javaw, jint ergo);
+
+typedef void (*PushEv_t)(int, int, int, float, float);
+typedef void (*SetWin_t)(ANativeWindow *, int, int);
+
+enum { EV_KEY = 1, EV_MBTN = 2, EV_MMOVE = 3, EV_SCROLL = 4 };
+
+static std::mutex g_mu;
+static PushEv_t g_push = nullptr;
+static SetWin_t g_setWin = nullptr;
+static ANativeWindow *g_pendingWin = nullptr;
+static int g_pw = 0, g_ph = 0;
 
 static std::string toStr(JNIEnv *env, jstring s) {
     if (!s) return "";
@@ -37,6 +50,31 @@ static void preload(const std::string &path) {
         LOGE("preload gagal %s: %s", path.c_str(), dlerror());
 }
 
+static void loadGlfw() {
+    const char *dir = getenv("LUMINA_LIBDIR");
+    if (!dir) return;
+    std::string p = std::string(dir) + "/libglfw.so";
+    void *h = dlopen(p.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { LOGE("libglfw.so: %s", dlerror()); return; }
+    std::lock_guard<std::mutex> l(g_mu);
+    g_push = (PushEv_t) dlsym(h, "lumina_glfw_push_event");
+    g_setWin = (SetWin_t) dlsym(h, "lumina_glfw_set_window");
+    if (g_pendingWin && g_setWin) g_setWin(g_pendingWin, g_pw, g_ph);
+    LOGI("libglfw dimuat push=%p setWin=%p", (void *) g_push, (void *) g_setWin);
+}
+
+// NG-GL4ES butuh tahu cara mencari fungsi GLES/EGL: beri eglGetProcAddress (kalau simbolnya ada).
+static void setupGl4es() {
+    const char *p = getenv("LUMINA_GL_LIB");
+    if (!p) return;
+    void *h = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { LOGE("gl4es: %s", dlerror()); return; }
+    typedef void (*SetProc_t)(void *(*)(const char *));
+    auto setProc = (SetProc_t) dlsym(h, "set_getprocaddress");
+    if (setProc) setProc((void *(*)(const char *)) eglGetProcAddress);
+    LOGI("gl4es dimuat %s set_getprocaddress=%p", p, (void *) setProc);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_entarligth_launcher_NativeBridge_launch(JNIEnv *env, jclass,
                                                  jstring jHome, jstring jWork,
@@ -45,18 +83,27 @@ Java_com_entarligth_launcher_NativeBridge_launch(JNIEnv *env, jclass,
     std::string work = toStr(env, jWork);
     std::string logp = toStr(env, jLog);
 
-    // stdout/stderr JVM -> file log
     int fd = open(logp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
 
     setenv("JAVA_HOME", home.c_str(), 1);
     setenv("HOME", work.c_str(), 1);
     std::string ld = home + "/lib:" + home + "/lib/jli:" + home + "/lib/server:" + home + "/lib/client";
+    if (const char *lib = getenv("LUMINA_LIBDIR")) ld += std::string(":") + lib;
     if (const char *old = getenv("LD_LIBRARY_PATH")) ld += std::string(":") + old;
     setenv("LD_LIBRARY_PATH", ld.c_str(), 1);
+
+    // pengaturan GL4ES (OpenGL -> GLES2)
+    setenv("LIBGL_ES", "3", 1);
+    setenv("LIBGL_GL", "32", 1);
+    setenv("LIBGL_NOERROR", "1", 1);
+    setenv("LIBGL_MIPMAP", "3", 1);
+    setenv("LIBGL_NORMALIZE", "1", 1);
     chdir(work.c_str());
 
-    // urutan muat eksplisit (LD_LIBRARY_PATH runtime tidak selalu dibaca bionic)
+    loadGlfw();
+    setupGl4es();
+
     preload(home + "/lib/server/libjvm.so");
     preload(home + "/lib/client/libjvm.so");
     preload(home + "/lib/libverify.so");
@@ -83,62 +130,49 @@ Java_com_entarligth_launcher_NativeBridge_launch(JNIEnv *env, jclass,
     return rc;
 }
 
+// ---------------- Surface dari Activity ----------------
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_entarligth_launcher_NativeBridge_setSurface(JNIEnv *env, jclass, jobject surface, jint w, jint h) {
+    ANativeWindow *nw = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    std::lock_guard<std::mutex> l(g_mu);
+    if (g_setWin) {
+        g_pendingWin = nw;           // libglfw memegang dan melepas referensi lamanya sendiri
+        g_pw = w; g_ph = h;
+        g_setWin(nw, w, h);
+    } else {
+        if (g_pendingWin) ANativeWindow_release(g_pendingWin);
+        g_pendingWin = nw; g_pw = w; g_ph = h;
+    }
+}
 
 // ---------------- Input controller virtual ----------------
-// Antrean event untuk GLFW shim (dibaca lewat lumina_poll_event / lumina_get_gamepad).
-struct LuminaInputEvent { int type; int a; int b; float x; float y; };
-enum { LEV_KEY = 1, LEV_MOUSE_BTN = 2, LEV_MOUSE_MOVE = 3, LEV_SCROLL = 4 };
 
-static std::mutex g_inMu;
-static std::deque<LuminaInputEvent> g_inQ;
-static float g_padAxes[6] = {0, 0, 0, 0, -1, -1};
-static int g_padButtons = 0;
-
-static void pushEv(const LuminaInputEvent &e) {
-    std::lock_guard<std::mutex> l(g_inMu);
-    if (g_inQ.size() >= 4096) g_inQ.pop_front();
-    g_inQ.push_back(e);
-}
-
-extern "C" bool lumina_poll_event(LuminaInputEvent *out) {
-    std::lock_guard<std::mutex> l(g_inMu);
-    if (g_inQ.empty()) return false;
-    *out = g_inQ.front();
-    g_inQ.pop_front();
-    return true;
-}
-
-extern "C" void lumina_get_gamepad(float *axes6, int *buttons) {
-    std::lock_guard<std::mutex> l(g_inMu);
-    for (int i = 0; i < 6; i++) axes6[i] = g_padAxes[i];
-    *buttons = g_padButtons;
+static void sendEv(int type, int a, int b, float x, float y) {
+    std::lock_guard<std::mutex> l(g_mu);
+    if (g_push) g_push(type, a, b, x, y);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_entarligth_launcher_NativeBridge_sendKey(JNIEnv *, jclass, jint key, jboolean down) {
-    pushEv({LEV_KEY, key, down ? 1 : 0, 0.f, 0.f});
+    sendEv(EV_KEY, key, down ? 1 : 0, 0.f, 0.f);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_entarligth_launcher_NativeBridge_sendMouseButton(JNIEnv *, jclass, jint btn, jboolean down) {
-    pushEv({LEV_MOUSE_BTN, btn, down ? 1 : 0, 0.f, 0.f});
+    sendEv(EV_MBTN, btn, down ? 1 : 0, 0.f, 0.f);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_entarligth_launcher_NativeBridge_sendMouseMove(JNIEnv *, jclass, jfloat dx, jfloat dy) {
-    pushEv({LEV_MOUSE_MOVE, 0, 0, dx, dy});
+    sendEv(EV_MMOVE, 0, 0, dx, dy);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_entarligth_launcher_NativeBridge_sendScroll(JNIEnv *, jclass, jfloat dy) {
-    pushEv({LEV_SCROLL, 0, 0, 0.f, dy});
+    sendEv(EV_SCROLL, 0, 0, 0.f, dy);
 }
 
+// State gamepad belum dipakai (Minecraft Java vanilla tidak membaca gamepad).
 extern "C" JNIEXPORT void JNICALL
-Java_com_entarligth_launcher_NativeBridge_sendGamepad(JNIEnv *env, jclass, jfloatArray axes, jint buttons) {
-    float tmp[6];
-    env->GetFloatArrayRegion(axes, 0, 6, tmp);
-    std::lock_guard<std::mutex> l(g_inMu);
-    for (int i = 0; i < 6; i++) g_padAxes[i] = tmp[i];
-    g_padButtons = buttons;
-}
+Java_com_entarligth_launcher_NativeBridge_sendGamepad(JNIEnv *, jclass, jfloatArray, jint) {}

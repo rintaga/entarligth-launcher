@@ -4,6 +4,9 @@ import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.system.Os;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
@@ -71,6 +74,15 @@ public class MainActivity extends Activity {
         root.addView(buttons);
         root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
         FrameLayout frame = new FrameLayout(this);
+        SurfaceView gameView = new SurfaceView(this);
+        gameView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder h) { }
+            @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int hh) {
+                NativeBridge.setSurface(h.getSurface(), w, hh);
+            }
+            @Override public void surfaceDestroyed(SurfaceHolder h) { NativeBridge.setSurface(null, 0, 0); }
+        });
+        frame.addView(gameView, new FrameLayout.LayoutParams(-1, -1));
         frame.addView(root);
         controller = new PS5Controller(this);
         controller.setVisibility(View.GONE);
@@ -194,13 +206,22 @@ public class MainActivity extends Activity {
         started = true;
         try {
             setStatus("Memuat Java...");
-            runOnUiThread(() -> controller.setVisibility(View.VISIBLE));
+            runOnUiThread(() -> {
+                controller.setVisibility(View.VISIBLE);
+                ((View) status.getParent()).setVisibility(View.GONE);
+            });
             String version = asset("game/version.id").trim();
             String assetId = asset("game/assetindex.id").trim();
 
+            String libDir = getApplicationInfo().nativeLibraryDir;
+            Os.setenv("LUMINA_LIBDIR", libDir, true);
+            File lw = prepareLwjgl();
+            File lwNat = new File(lw, "natives/armeabi-v7a");
+
             List<String> cp = new ArrayList<>();
             cp.add(new File(game, "client.jar").getPath());
-            collect(new File(game, "libraries"), cp);
+            collect(new File(game, "libraries"), cp); // termasuk lwjgl-glfw resmi (didahulukan)
+            collect(lw, cp);                          // LWJGL build Android
 
             List<String> a = new ArrayList<>();
             a.add("-Xms256M");
@@ -209,6 +230,18 @@ public class MainActivity extends Activity {
             a.add("-Djava.io.tmpdir=" + getCacheDir());
             a.add("-Duser.home=" + game);
             a.add("-Dos.name=Linux");
+            a.add("-Djava.library.path=" + libDir + ":" + lwNat);
+            a.add("-Dorg.lwjgl.librarypath=" + lwNat);
+            a.add("-Dorg.lwjgl.glfw.libname=" + libDir + "/libglfw.so");
+            a.add("-Dorg.lwjgl.system.allocator=system");
+            String gl4es = findLib(libDir, "libng_gl4es");
+            if (gl4es == null) gl4es = findLib(libDir, "libgl4es");
+            if (gl4es != null) {
+                Os.setenv("LUMINA_GL_LIB", gl4es, true);
+                a.add("-Dorg.lwjgl.opengl.libname=" + gl4es);
+            }
+            File oal = new File(libDir, "libopenal.so");
+            if (oal.exists()) a.add("-Dorg.lwjgl.openal.libname=" + oal.getPath());
             a.add("-cp");
             a.add(String.join(":", cp));
             a.add(MAIN_CLASS);
@@ -222,12 +255,51 @@ public class MainActivity extends Activity {
             File logf = new File(game, "latestlog.txt");
             int rc = NativeBridge.launch(jre.getPath(), game.getPath(), logf.getPath(),
                     a.toArray(new String[0]));
+            runOnUiThread(() -> ((View) status.getParent()).setVisibility(View.VISIBLE));
             log("exit code " + rc + "\n" + tail(logf));
         } catch (Throwable t) {
             log("Error: " + t);
         } finally {
             started = false;
         }
+    }
+
+    // ---- LWJGL (assets/lwjgl/<versi>) ----
+
+    private File prepareLwjgl() throws IOException {
+        String ver = "";
+        try { ver = asset("game/lwjgl.version").trim(); } catch (IOException ignored) { }
+        String[] vers = getAssets().list("lwjgl");
+        if (vers == null || vers.length == 0) throw new FileNotFoundException("assets/lwjgl");
+        if (!Arrays.asList(vers).contains(ver)) ver = vers[vers.length - 1];
+        File dst = new File(new File(getFilesDir(), ".plugin"), "lwjgl/" + ver);
+        File ok = new File(dst, ".ok");
+        if (!ok.exists()) {
+            setStatus("Mengekstrak LWJGL " + ver + "...");
+            copyAssetDir("lwjgl/" + ver, dst);
+            ok.createNewFile();
+        }
+        return dst;
+    }
+
+    private void copyAssetDir(String path, File dst) throws IOException {
+        String[] l = getAssets().list(path);
+        if (l != null && l.length > 0) {
+            dst.mkdirs();
+            for (String n : l) copyAssetDir(path + "/" + n, new File(dst, n));
+        } else {
+            dst.getParentFile().mkdirs();
+            try (InputStream in = getAssets().open(path); OutputStream os = new FileOutputStream(dst)) {
+                copy(in, os);
+            }
+        }
+    }
+
+    private static String findLib(String dir, String prefix) {
+        File[] fs = new File(dir).listFiles();
+        if (fs == null) return null;
+        for (File f : fs) if (f.getName().startsWith(prefix) && f.getName().endsWith(".so")) return f.getPath();
+        return null;
     }
 
     // ---- util ----
