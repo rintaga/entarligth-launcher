@@ -22,9 +22,11 @@ jobs:
           yes | "$SDKM" --licenses > /dev/null || true
           "$SDKM" "ndk;23.2.8568313" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Fetch JRE runtime
+      - name: Game files (client.jar, server.jar, libraries, asset index)
+        run: python3 scripts/fetch_game.py
+
+      - name: Fetch JRE runtime (32-bit)
         env:
-          JRE_ARM64_URL: ${{ vars.JRE_ARM64_URL }}
           JRE_ARM_URL: ${{ vars.JRE_ARM_URL }}
         run: bash scripts/fetch_runtime.sh
 
@@ -33,6 +35,8 @@ jobs:
           gradle-version: '8.5'
 
       - name: Build APK
+        env:
+          MS_CLIENT_ID: ${{ vars.MS_CLIENT_ID }}
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
       - uses: actions/upload-artifact@v4

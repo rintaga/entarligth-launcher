@@ -49,13 +49,14 @@ Java_com_entarligth_launcher_NativeBridge_launch(JNIEnv *env, jclass,
 
     setenv("JAVA_HOME", home.c_str(), 1);
     setenv("HOME", work.c_str(), 1);
-    std::string ld = home + "/lib:" + home + "/lib/jli:" + home + "/lib/server";
+    std::string ld = home + "/lib:" + home + "/lib/jli:" + home + "/lib/server:" + home + "/lib/client";
     if (const char *old = getenv("LD_LIBRARY_PATH")) ld += std::string(":") + old;
     setenv("LD_LIBRARY_PATH", ld.c_str(), 1);
     chdir(work.c_str());
 
     // urutan muat eksplisit (LD_LIBRARY_PATH runtime tidak selalu dibaca bionic)
     preload(home + "/lib/server/libjvm.so");
+    preload(home + "/lib/client/libjvm.so");
     preload(home + "/lib/libverify.so");
 
     void *jli = dlopen((home + "/lib/libjli.so").c_str(), RTLD_LAZY | RTLD_GLOBAL);

@@ -3,31 +3,36 @@ package com.entarligth.launcher;
 import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
+import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import org.json.JSONObject;
+
 import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 public class MainActivity extends Activity {
-    private static final int REQ_JAR = 1;
-    private static final String MAIN_CLASS = "net.minecraft.client.main.Main";
-    private static final String HEAP = "-Xmx1024M";
+    private static final String MAIN_CLASS = "net.minecraft.client.Main";
+    private static final String HEAP = "-Xmx1024M"; // 32-bit: jangan terlalu besar
 
-    private TextView out;
+    private TextView status, out;
+    private LinearLayout buttons;
     private File jre, game;
     private volatile boolean started;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
-        File plugin = new File(getFilesDir(), ".plugin"); // folder tersembunyi
-        jre = new File(plugin, "jre");
+        jre = new File(new File(getFilesDir(), ".plugin"), "jre"); // folder tersembunyi
         game = new File(getFilesDir(), "game");
         game.mkdirs();
 
@@ -35,57 +40,160 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(32, 32, 32, 32);
 
-        Button imp = new Button(this);
-        imp.setText("Import client.jar");
-        imp.setOnClickListener(v -> {
-            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            i.addCategory(Intent.CATEGORY_OPENABLE);
-            i.setType("*/*");
-            startActivityForResult(i, REQ_JAR);
+        status = new TextView(this);
+        status.setTextSize(16);
+
+        buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.VERTICAL);
+        buttons.setVisibility(View.GONE);
+        Button login = new Button(this);
+        login.setText("Login Microsoft");
+        login.setOnClickListener(v -> { buttons.setVisibility(View.GONE); new Thread(this::login).start(); });
+        Button offline = new Button(this);
+        offline.setText("Main offline");
+        offline.setOnClickListener(v -> {
+            buttons.setVisibility(View.GONE);
+            MsAuth.Account a = new MsAuth.Account();
+            a.name = "Player"; a.uuid = "00000000000000000000000000000000"; a.token = "0";
+            new Thread(() -> launch(a)).start();
         });
+        buttons.addView(login);
+        buttons.addView(offline);
 
         out = new TextView(this);
         out.setTextIsSelectable(true);
         ScrollView sv = new ScrollView(this);
         sv.addView(out);
 
-        root.addView(imp);
+        root.addView(status);
+        root.addView(buttons);
         root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
         setContentView(root);
 
-        begin(); // langsung loading saat pertama dibuka
+        new Thread(this::prepare, "lumina-prepare").start(); // langsung loading saat dibuka
     }
 
-    @Override protected void onActivityResult(int req, int res, Intent data) {
-        if (req != REQ_JAR || res != RESULT_OK || data == null) return;
-        Uri u = data.getData();
-        new Thread(() -> {
-            try (InputStream in = getContentResolver().openInputStream(u);
-                 OutputStream os = new FileOutputStream(new File(game, "client.jar"))) {
-                copy(in, os);
-                log("client.jar diimpor.");
-                begin();
-            } catch (Throwable t) { log("Import gagal: " + t); }
-        }).start();
+    private void prepare() {
+        try {
+            extractRuntime();
+            extractGame();
+            downloadAssets();
+            setStatus("Memeriksa akun...");
+            MsAuth.Account a = MsAuth.restore(this);
+            if (a != null) launch(a);
+            else runOnUiThread(() -> { setStatus("Login untuk bermain online"); buttons.setVisibility(View.VISIBLE); });
+        } catch (FileNotFoundException e) {
+            log("File bawaan APK tidak ada (" + e.getMessage() + "). Periksa build GitHub (JRE_ARM_URL, client.jar).");
+        } catch (Throwable t) {
+            log("Error: " + t);
+        }
     }
 
-    private void begin() {
+    private void login() {
+        try {
+            MsAuth.DeviceCode d = MsAuth.startDeviceLogin();
+            runOnUiThread(() -> {
+                setStatus("Buka " + d.uri + " lalu masukkan kode:\n" + d.userCode);
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(d.uri)));
+            });
+            MsAuth.Account a = MsAuth.finishDeviceLogin(this, d);
+            launch(a);
+        } catch (Throwable t) {
+            log("Login gagal: " + t);
+            runOnUiThread(() -> buttons.setVisibility(View.VISIBLE));
+        }
+    }
+
+    // ---- runtime & game files ----
+
+    private void extractRuntime() throws IOException {
+        File ok = new File(jre, ".ok");
+        if (ok.exists()) return;
+        setStatus("Mengekstrak runtime Java...");
+        try (InputStream in = getAssets().open("jre-arm.zip")) { unzip(in, jre); }
+        ok.createNewFile();
+    }
+
+    private void extractGame() throws IOException {
+        for (String n : new String[]{"client.jar", "server.jar"}) {
+            File dst = new File(game, n);
+            long len = getAssets().openFd("game/" + n).getLength();
+            if (dst.exists() && dst.length() == len) continue;
+            setStatus("Menyalin " + n + "...");
+            try (InputStream in = getAssets().open("game/" + n);
+                 OutputStream os = new FileOutputStream(dst)) { copy(in, os); }
+        }
+        File libs = new File(game, "libraries");
+        File ok = new File(libs, ".ok");
+        if (!ok.exists()) {
+            setStatus("Mengekstrak library...");
+            try (InputStream in = getAssets().open("game/libraries.zip")) { unzip(in, libs); }
+            ok.createNewFile();
+        }
+    }
+
+    private void downloadAssets() throws Exception {
+        String id = asset("game/assetindex.id").trim();
+        String idx = asset("game/assetindex.json");
+        File idxf = new File(game, "assets/indexes/" + id + ".json");
+        idxf.getParentFile().mkdirs();
+        try (OutputStream os = new FileOutputStream(idxf)) { os.write(idx.getBytes("UTF-8")); }
+
+        JSONObject objs = new JSONObject(idx).getJSONObject("objects");
+        List<String> todo = new ArrayList<>();
+        for (Iterator<String> it = objs.keys(); it.hasNext(); ) {
+            String h = objs.getJSONObject(it.next()).getString("hash");
+            if (!new File(game, "assets/objects/" + h.substring(0, 2) + "/" + h).exists()) todo.add(h);
+        }
+        if (todo.isEmpty()) return;
+
+        final int total = todo.size();
+        AtomicInteger done = new AtomicInteger();
+        ExecutorService ex = Executors.newFixedThreadPool(8);
+        List<Future<?>> fs = new ArrayList<>();
+        for (String h : todo) {
+            fs.add(ex.submit(() -> {
+                File f = new File(game, "assets/objects/" + h.substring(0, 2) + "/" + h);
+                download("https://resources.download.minecraft.net/" + h.substring(0, 2) + "/" + h, f);
+                int d = done.incrementAndGet();
+                if (d % 50 == 0 || d == total) setStatus("Mengunduh assets " + d + "/" + total);
+                return null;
+            }));
+        }
+        try { for (Future<?> f : fs) f.get(); } finally { ex.shutdown(); }
+    }
+
+    private static void download(String url, File dst) throws IOException {
+        dst.getParentFile().mkdirs();
+        File tmp = new File(dst.getPath() + ".part");
+        IOException last = null;
+        for (int i = 0; i < 3; i++) {
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(20000);
+                c.setReadTimeout(30000);
+                try (InputStream in = c.getInputStream(); OutputStream os = new FileOutputStream(tmp)) { copy(in, os); }
+                if (!tmp.renameTo(dst)) throw new IOException("rename gagal");
+                return;
+            } catch (IOException e) { last = e; }
+        }
+        throw last;
+    }
+
+    // ---- launch ----
+
+    private void launch(MsAuth.Account acc) {
         if (started) return;
         started = true;
-        new Thread(this::start, "lumina-launch").start();
-    }
-
-    private void start() {
         try {
-            String abi = Build.SUPPORTED_64_BIT_ABIS.length > 0 ? "arm64" : "arm";
-            File ok = new File(jre, ".ok");
-            if (!ok.exists()) {
-                log("Mengekstrak runtime (" + abi + ")...");
-                try (InputStream in = getAssets().open("jre-" + abi + ".zip")) { unzip(in, jre); }
-                ok.createNewFile();
-            }
+            setStatus("Memuat Java...");
+            String version = asset("game/version.id").trim();
+            String assetId = asset("game/assetindex.id").trim();
 
-            File jar = new File(game, "client.jar");
+            List<String> cp = new ArrayList<>();
+            cp.add(new File(game, "client.jar").getPath());
+            collect(new File(game, "libraries"), cp);
+
             List<String> a = new ArrayList<>();
             a.add("-Xms256M");
             a.add(HEAP);
@@ -93,24 +201,20 @@ public class MainActivity extends Activity {
             a.add("-Djava.io.tmpdir=" + getCacheDir());
             a.add("-Duser.home=" + game);
             a.add("-Dos.name=Linux");
-            if (jar.exists()) {
-                a.add("-cp");
-                a.add(classpath(jar));
-                a.add(MAIN_CLASS);
-                a.addAll(Arrays.asList("--username", "Player", "--version", "entarligth",
-                        "--gameDir", game.getPath(),
-                        "--assetsDir", new File(game, "assets").getPath(),
-                        "--accessToken", "0"));
-            } else {
-                a.add("-version"); // uji JVM
-            }
+            a.add("-cp");
+            a.add(String.join(":", cp));
+            a.add(MAIN_CLASS);
+            a.addAll(Arrays.asList(
+                    "--username", acc.name, "--uuid", acc.uuid, "--accessToken", acc.token,
+                    "--userType", "msa", "--version", version, "--versionType", "release",
+                    "--gameDir", game.getPath(),
+                    "--assetsDir", new File(game, "assets").getPath(),
+                    "--assetIndex", assetId));
 
             File logf = new File(game, "latestlog.txt");
             int rc = NativeBridge.launch(jre.getPath(), game.getPath(), logf.getPath(),
                     a.toArray(new String[0]));
             log("exit code " + rc + "\n" + tail(logf));
-        } catch (FileNotFoundException e) {
-            log("Runtime tidak ada di APK. Isi variabel JRE_ARM64_URL / JRE_ARM_URL di GitHub, lalu build ulang.");
         } catch (Throwable t) {
             log("Error: " + t);
         } finally {
@@ -118,12 +222,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private String classpath(File jar) {
-        List<String> cp = new ArrayList<>();
-        cp.add(jar.getPath());
-        collect(new File(game, "libraries"), cp);
-        return String.join(":", cp);
-    }
+    // ---- util ----
 
     private static void collect(File dir, List<String> cp) {
         File[] fs = dir.listFiles();
@@ -131,6 +230,14 @@ public class MainActivity extends Activity {
         for (File f : fs) {
             if (f.isDirectory()) collect(f, cp);
             else if (f.getName().endsWith(".jar")) cp.add(f.getPath());
+        }
+    }
+
+    private String asset(String name) throws IOException {
+        try (InputStream in = getAssets().open(name)) {
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            copy(in, bo);
+            return bo.toString("UTF-8");
         }
     }
 
@@ -165,7 +272,6 @@ public class MainActivity extends Activity {
         } catch (IOException e) { return "(log kosong)"; }
     }
 
-    private void log(String s) {
-        runOnUiThread(() -> out.append(s + "\n"));
-    }
+    private void setStatus(String s) { runOnUiThread(() -> status.setText(s)); }
+    private void log(String s) { runOnUiThread(() -> out.append(s + "\n")); }
 }
