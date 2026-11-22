@@ -1,3 +1,5 @@
+
+l
 #!/usr/bin/env bash
 # Mengunduh JRE Android 32-bit (ARM) lalu mengemasnya jadi app/src/main/assets/jre-arm.zip
 # JRE_ARM_URL boleh berisi beberapa URL dipisah spasi (mis. paket "universal" + "bin-arm").
@@ -6,7 +8,7 @@ set -euo pipefail
 REPO="$PWD"
 OUT="$REPO/app/src/main/assets"
 mkdir -p "$OUT"
-urls="${JRE_ARM_URL:-}"
+urls="$(printf '%s' "${JRE_ARM_URL:-}" | tr -d '\r')"
 if [ -z "$urls" ]; then
   echo "::warning::JRE_ARM_URL kosong, runtime dilewati (APK tidak bisa menjalankan Java)"
   exit 0
